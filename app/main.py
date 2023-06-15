@@ -1,45 +1,60 @@
-from typing import Optional
+import os
+from typing import Optional, Any
 import requests
 import tweepy
-from fastapi import FastAPI
-from pydantic import BaseModel, Json, validator
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import Field, BaseModel, root_validator
 from tweepy_authlib import CookieSessionUserHandler
 
 
 class AuthInfo(BaseModel):
-    screen_name: str
-    password: str
-    cookies_json: Optional[Json[dict]] = None
+    """Twitter auth info"""
+    screen_name: str = Field(..., description="Twitter screen name without @")
+    password: str = Field(..., description="Twitter password")
+    cookies: Optional[dict[str, str]] = Field(
+        None, description="Twitter cookies json")
 
 
 class BaseRequest(BaseModel):
-    auth: AuthInfo
-    logout: bool = False
+    """Base Request Model"""
+    auth: AuthInfo = Field(..., description="Twitter auth info")
+    logout: bool = Field(False, description="Logout after process")
 
 
 class BaseResponse(BaseModel):
-    cookies_json: Optional[Json[dict]] = None
+    """Base Response Model"""
+    cookies: Optional[dict[str, str]] = Field(
+        None, description="Twitter cookies json")
+    response: Optional[dict[str, Any]] = Field(
+        None, description="Twitter api response")
 
 
 class CreateBlockParams(BaseModel):
-    screen_name: Optional[str] = None
-    user_id: Optional[str] = None
-    include_entities: bool = True
-    skip_status: bool = False
+    """
+    Parameters for API.create_block
 
-    @validator('screen_name, user_id')
-    def check_params(cls, v, values):
-        if v is None:
-            if values['screen_name'] is None and values['user_id'] is None:
-                raise ValueError('screen_name or user_id must be specified')
-        return v
+    screen_name or user_id must be specified
+    """
+    screen_name: Optional[str] = Field(
+        None, description="Twitter screen name without @")
+    user_id: Optional[str] = Field(None, description="Twitter user id")
+    include_entities: bool = Field(
+        False, description="If True, include entries nodes (defaults: False)")
+    skip_status: bool = Field(
+        True, description="If True, statuses will not be included in the returned user objects (defaults: True)")
+
+    @root_validator
+    def check_params(cls, values: dict):
+        if (values.get('screen_name') or values.get('user_id')) is None:
+            raise ValueError('screen_name or user_id must be specified')
+        return values
 
 
 class CreateBlockRequest(BaseRequest):
     params: CreateBlockParams
 
 
-app = FastAPI()
+app = FastAPI(debug=os.environ.get("DEBUG", False))
 
 
 @app.get("/")
@@ -50,25 +65,29 @@ async def root():
 @app.post("/create-block", response_model=BaseResponse)
 async def create_block(req: CreateBlockRequest):
     auth_handler = get_auth_handler(req.auth)
-    api = tweepy.API(auth_handler)
-    api.create_block(**req.params.dict())
-    cookies = api.session.cookies.get_dict()
+    try:
+        api = tweepy.API(auth_handler)
+        res: tweepy.User = api.create_block(**req.params.dict())
+        cookies = auth_handler.get_cookies().get_dict()
+    except Exception as e:
+        auth_handler.logout()
+        raise e
     if req.logout:
         auth_handler.logout()
         cookies = None
-    return BaseResponse(cookies_json=cookies)
+    return BaseResponse(cookies_json=cookies, response=res._json)
 
 
 def get_auth_handler(auth: AuthInfo) -> CookieSessionUserHandler:
-    if auth.cookies_json is not None:
-        try:
-            res = requests.get("https://tweetdeck.twitter.com/",
-                               cookies=auth.cookies_json)
-            if "twid" in res.cookies:
-                raise ValueError("Invalid cookie")
-            return CookieSessionUserHandler(cookies=res.cookies)
-        except Exception as e:
-            pass
-    auth_handler = CookieSessionUserHandler(
-        screen_name=auth.screen_name, password=auth.password)
-    return auth_handler
+    if auth.cookies is not None:
+        ses = requests.Session()
+        ses.cookies.update(auth.cookies)
+        ses.get("https://tweetdeck.twitter.com/")
+        if "twid" in ses.cookies:
+            return CookieSessionUserHandler(cookies=ses.cookies)
+    return CookieSessionUserHandler(screen_name=auth.screen_name, password=auth.password)
+
+
+@app.exception_handler(tweepy.TweepyException)
+async def handle_tweepy_exception(request: Request, exc: tweepy.TweepyException):
+    raise HTTPException(status_code=401, detail=str(exc))
