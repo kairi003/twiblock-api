@@ -62,6 +62,13 @@ async def root():
     return {"greeting": "Hello world"}
 
 
+@app.post("/login", response_model=AuthInfo)
+async def login(auth: AuthInfo) -> AuthInfo:
+    auth_handler = get_auth_handler(auth)
+    auth.cookies = auth_handler.get_cookies().get_dict()
+    return auth
+
+
 @app.post("/create-block", response_model=BaseResponse)
 async def create_block(req: CreateBlockRequest):
     auth_handler = get_auth_handler(req.auth)
@@ -75,7 +82,7 @@ async def create_block(req: CreateBlockRequest):
     if req.logout:
         auth_handler.logout()
         cookies = None
-    return BaseResponse(cookies_json=cookies, response=res._json)
+    return BaseResponse(cookies=cookies, response=res._json)
 
 
 def get_auth_handler(auth: AuthInfo) -> CookieSessionUserHandler:
